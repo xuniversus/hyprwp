@@ -21,3 +21,6 @@ DISCLAIMER: Again, while the project is not licensed, any dependencies with lice
 If it wasn't obvious, only Linux and linux-wallpaperengine is officially supported,
 but should be able to use any binary that takes
 ```hyprctl monitors```, ```monitoraddedv2```, and ```monitorremoved``` ```MONITORNAME``` as monitor input argument.
+
+The config is very simple, the descriptions and arguments are seperated with whitespace, and if you need whitespace
+in the argument use quotes/"" to enclose the full argument.
