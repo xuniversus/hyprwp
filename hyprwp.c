@@ -277,6 +277,59 @@ char **build_child_argv(const monitor_info_t *info, Config *cfg, const char *wal
     return child_argv;
 }
 
+/* ---------------- Launch Monitor Process ---------------- */
+/*
+   This function encapsulates the common logic for launching a monitor process.
+   It selects a wallpaper (using the default or profile directory based on the
+   monitor description), forks a child process to execute the external binary,
+   and registers the process in the monitor table.
+*/
+void launch_monitor_process(const monitor_info_t *info, Config *cfg) {
+    const char *wallpaper_dir = cfg->papers;
+    if (use_profile_wallpapers(info->monitordesc, cfg) && cfg->profpapers)
+        wallpaper_dir = cfg->profpapers;
+    char *wallpaper = choose_random_wallpaper(wallpaper_dir);
+    if (!wallpaper) {
+        fprintf(stderr, "No wallpaper found in directory %s\n", wallpaper_dir);
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        free(wallpaper);
+        return;
+    }
+    if (pid == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) == -1) {
+            perror("prctl");
+            exit(EXIT_FAILURE);
+        }
+        if (getppid() == 1)
+            exit(EXIT_FAILURE);
+        FILE *devnull = fopen("/dev/null", "w");
+        if (devnull) {
+            dup2(fileno(devnull), STDOUT_FILENO);
+            fclose(devnull);
+        }
+        char **child_argv = build_child_argv(info, cfg, wallpaper);
+        execvp(child_argv[0], child_argv);
+        perror("execvp");
+        free(child_argv);
+        exit(EXIT_FAILURE);
+    }
+    add_monitor_proc_ht(info->monitorname, pid);
+    free(wallpaper);
+}
+
+/* ---------------- Bootstrap Monitor from Positional Argument ---------------- */
+void bootstrap_monitor(const char *monitor_name, Config *cfg) {
+    monitor_info_t info;
+    info.monitorid = (char *)monitor_name;
+    info.monitorname = (char *)monitor_name;
+    info.monitordesc = (char *)monitor_name;
+    launch_monitor_process(&info, cfg);
+}
+
 /* ---------------- Event Handling ---------------- */
 /* Each event is in the format: EVENT>>DATA */
 void handle_line(char *line, Config *cfg) {
@@ -290,41 +343,7 @@ void handle_line(char *line, Config *cfg) {
             fprintf(stderr, "Invalid monitoraddedv2 data\n");
             return;
         }
-        const char *wallpaper_dir = cfg->papers;
-        if (use_profile_wallpapers(info.monitordesc, cfg) && cfg->profpapers)
-            wallpaper_dir = cfg->profpapers;
-        char *wallpaper = choose_random_wallpaper(wallpaper_dir);
-        if (!wallpaper) {
-            fprintf(stderr, "No wallpaper found in directory %s\n", wallpaper_dir);
-            return;
-        }
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            free(wallpaper);
-            return;
-        }
-        if (pid == 0) {
-            if (prctl(PR_SET_PDEATHSIG, SIGTERM) == -1) {
-                perror("prctl");
-                exit(EXIT_FAILURE);
-            }
-            if (getppid() == 1)
-                exit(EXIT_FAILURE);
-            /* Redirect stdout to /dev/null */
-            FILE *devnull = fopen("/dev/null", "w");
-            if (devnull) {
-                dup2(fileno(devnull), STDOUT_FILENO);
-                fclose(devnull);
-            }
-            char **child_argv = build_child_argv(&info, cfg, wallpaper);
-            execvp(child_argv[0], child_argv);
-            perror("execvp");
-            free(child_argv);
-            exit(EXIT_FAILURE);
-        }
-        add_monitor_proc_ht(info.monitorname, pid);
-        free(wallpaper);
+        launch_monitor_process(&info, cfg);
     } else if (strcmp(line, "monitorremoved") == 0) {
         char *monitorname = data;
         monitor_entry_t *entry;
@@ -341,12 +360,15 @@ void handle_line(char *line, Config *cfg) {
 /* ---------------- Main ---------------- */
 int main(int argc, char *argv[]) {
     const char *config_file = "config.txt";
-    for (int i = 1; i < argc; i++) {
+    int i = 1;
+    while (i < argc) {
         if (strcmp(argv[i], "--config") == 0) {
             if (++i < argc)
                 config_file = argv[i];
             else { fprintf(stderr, "Missing filename for --config\n"); exit(EXIT_FAILURE); }
         }
+        else break;
+        i++;
     }
     Config *cfg = read_config(config_file);
     if (!cfg) { fprintf(stderr, "Failed to read config\n"); exit(EXIT_FAILURE); }
@@ -373,6 +395,13 @@ int main(int argc, char *argv[]) {
     free(exe_path);
 
     srand(time(NULL));
+
+    /* Bootstrap monitors provided as extra positional arguments */
+    while (i < argc) {
+        bootstrap_monitor(argv[i], cfg);
+        i++;
+        sleep(3);
+    }
 
     struct sigaction sa;
     sa.sa_handler = sigchld_handler;
