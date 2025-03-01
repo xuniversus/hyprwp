@@ -13,18 +13,18 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/prctl.h>
-#include "uthash.h"  // Hash table macros
 
-/* ---------------- Configuration Structures ---------------- */
+// ---------------- Configuration Structures ----------------
 typedef struct {
     char *exe;             // external binary to execute
     char **args;           // array of argument tokens for the binary
     int args_count;        // number of tokens
     char *papers;          // default wallpaper directory
-    char *profpapers;   // alternative wallpaper directory
-    char *assets;          // asset directory
-    char **profmonitors;// array of monitor descriptions triggering alternative wallpapers
+    char *profpapers;      // alternative wallpaper directory
+    char *assets;          // asset directory (needs to be passed as assetsdir)
+    char **profmonitors;   // monitor descriptions triggering alternative wallpapers
     int profmonitors_count;
+    int timer;
 } Config;
 
 /* ---------------- Bracketed List Parser ---------------- */
@@ -86,23 +86,19 @@ Config *read_config(const char *filename) {
     Config *cfg = calloc(1, sizeof(Config));
     if (!cfg) { perror("calloc"); fclose(fp); return NULL; }
 
-    char *trim = NULL;
+    char *line = NULL;
     size_t len = 0;
-    while (getline(&trim, &len, fp) != -1) {
-        char *line = trim;
-        while (*line && isspace((unsigned char)*line)) line++;
-        if (line[0] == '#' || line[0] == '\0' || line[0] == '\n')
+    while (getline(&line, &len, fp) != -1) {
+        char *trim = line;
+        while (*trim && isspace((unsigned char)*trim)) trim++;
+        if (trim[0] == '#' || trim[0] == '\0' || trim[0] == '\n')
             continue;
-        char *eq = strchr(line, '=');
+        char *eq = strchr(trim, '=');
         if (!eq)
             continue;
         *eq = '\0';
-        char *key = line;
-        char *value = eq + 1;
-        // Remove any trailing newline.
-        key = trim_whitespace(key);
-        value = trim_whitespace(value);
-
+        char *key = trim_whitespace(trim);
+        char *value = trim_whitespace(eq + 1);
         if (strcmp(key, "exe") == 0) {
             cfg->exe = strdup(value);
         } else if (strcmp(key, "args") == 0) {
@@ -115,9 +111,11 @@ Config *read_config(const char *filename) {
             cfg->assets = strdup(value);
         } else if (strcmp(key, "profmonitors") == 0) {
             cfg->profmonitors = parse_list(value, &cfg->profmonitors_count);
+        } else if (strcmp(key, "timer") == 0) {
+            cfg->timer = atoi(value);
         }
     }
-    free(trim);
+    free(line);
     fclose(fp);
     return cfg;
 }
@@ -141,49 +139,8 @@ void free_config(Config *cfg) {
     free(cfg);
 }
 
-/* ---------------- Monitor Process Hashtable ---------------- */
-typedef struct {
-    char monitorName[256]; // key
-    pid_t pid;
-    UT_hash_handle hh;
-} monitor_entry_t;
-
-static monitor_entry_t *monitor_table = NULL;
-
-void add_monitor_proc_ht(const char *monitorName, pid_t pid) {
-    monitor_entry_t *entry = malloc(sizeof(monitor_entry_t));
-    if (!entry) { perror("malloc"); exit(EXIT_FAILURE); }
-    snprintf(entry->monitorName, sizeof(entry->monitorName), "%s", monitorName);
-    entry->pid = pid;
-    HASH_ADD_STR(monitor_table, monitorName, entry);
-}
-
-void remove_monitor_proc_ht(const char *monitorName) {
-    monitor_entry_t *entry;
-    HASH_FIND_STR(monitor_table, monitorName, entry);
-    if (entry) {
-        HASH_DEL(monitor_table, entry);
-        free(entry);
-    }
-}
-
-int belongs_to_same_group(pid_t pid) {
-    pid_t pg = getpgid(pid);
-    if (pg == -1) return 0;
-    return (pg == getpgid(0));
-}
-
-void cleanup_dead_processes(void) {
-    monitor_entry_t *entry, *tmp;
-    HASH_ITER(hh, monitor_table, entry, tmp) {
-        if (kill(entry->pid, 0) != 0 || !belongs_to_same_group(entry->pid)) {
-            HASH_DEL(monitor_table, entry);
-            free(entry);
-        }
-    }
-}
-
-/* ---------------- Wallpaper Selection ---------------- */
+/* ---------------- Random Wallpaper Selection ---------------- */
+/* Returns a random wallpaper file (full path) from the given directory. */
 char *choose_random_wallpaper(const char *dirpath) {
     DIR *dir = opendir(dirpath);
     if (!dir) { perror("opendir"); return NULL; }
@@ -211,13 +168,100 @@ char *choose_random_wallpaper(const char *dirpath) {
     return result;
 }
 
-/* ---------------- Signal Handling ---------------- */
-volatile sig_atomic_t child_died_flag = 0;
-void sigchld_handler(int signum) {
-    (void)signum;
-    child_died_flag = 1;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        ;
+/* Check if monitordesc matches any string in the profmonitors array.
+   Returns 1 if it does (and if a profpapers directory is set), else 0. */
+int use_profile_wallpapers(const char *monitordesc, Config *cfg) {
+    if (!cfg->profpapers)
+        return 0;
+    for (int i = 0; i < cfg->profmonitors_count; i++) {
+        if (strcmp(monitordesc, cfg->profmonitors[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* ---------------- Monitor Data Structures ---------------- */
+/* For each monitor we store its name and the chosen wallpaper. */
+typedef struct {
+    char *name;
+    char *wallpaper;
+    char *monitordesc;
+} MonitorEntry;
+
+typedef struct {
+    MonitorEntry **entries;
+    int count;
+    int capacity;
+} MonitorArray;
+
+void init_monitor_array(MonitorArray *ma) {
+    ma->count = 0;
+    ma->capacity = 4;
+    ma->entries = malloc(ma->capacity * sizeof(MonitorEntry *));
+    if (!ma->entries) { perror("malloc"); exit(EXIT_FAILURE); }
+}
+
+int find_monitor_index(MonitorArray *ma, const char *name) {
+    for (int i = 0; i < ma->count; i++) {
+        if (strcmp(ma->entries[i]->name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* Adds a monitor entry. If monitordesc is provided, use it to determine the wallpaper directory.
+   For bootstrapped monitors, monitordesc can be the same as name. */
+void add_monitor_entry(MonitorArray *ma, const char *name, const char *monitordesc, Config *cfg) {
+    if (find_monitor_index(ma, name) != -1)
+        return; // already present
+
+    const char *wallpaper_dir = cfg->papers;
+    if (use_profile_wallpapers(monitordesc, cfg))
+        wallpaper_dir = cfg->profpapers;
+
+    char *wallpaper = choose_random_wallpaper(wallpaper_dir);
+    if (!wallpaper) {
+        fprintf(stderr, "No wallpaper found in directory %s for monitor %s\n", wallpaper_dir, name);
+        return;
+    }
+
+    MonitorEntry *entry = malloc(sizeof(MonitorEntry));
+    if (!entry) { perror("malloc"); exit(EXIT_FAILURE); }
+    entry->name = strdup(name);
+    entry->monitordesc = strdup(monitordesc);
+    entry->wallpaper = wallpaper; // allocated by choose_random_wallpaper
+
+    if (ma->count == ma->capacity) {
+        ma->capacity *= 2;
+        MonitorEntry **tmp = realloc(ma->entries, ma->capacity * sizeof(MonitorEntry *));
+        if (!tmp) { perror("realloc"); exit(EXIT_FAILURE); }
+        ma->entries = tmp;
+    }
+    ma->entries[ma->count++] = entry;
+}
+
+void remove_monitor_entry(MonitorArray *ma, const char *name) {
+    int idx = find_monitor_index(ma, name);
+    if (idx == -1)
+        return;
+    free(ma->entries[idx]->name);
+    free(ma->entries[idx]->monitordesc);
+    free(ma->entries[idx]->wallpaper);
+    free(ma->entries[idx]);
+    for (int i = idx; i < ma->count - 1; i++) {
+        ma->entries[i] = ma->entries[i+1];
+    }
+    ma->count--;
+}
+
+void free_monitor_array(MonitorArray *ma) {
+    for (int i = 0; i < ma->count; i++) {
+        free(ma->entries[i]->name);
+        free(ma->entries[i]->monitordesc);
+        free(ma->entries[i]->wallpaper);
+        free(ma->entries[i]);
+    }
+    free(ma->entries);
 }
 
 /* ---------------- Monitor Event Parsing ---------------- */
@@ -240,63 +284,58 @@ int parse_monitoradded_data(char *data, monitor_info_t *info) {
     return 0;
 }
 
-/* Check if monitordesc matches any string in the profmonitors array */
-int use_profile_wallpapers(const char *monitordesc, Config *cfg) {
-    for (int i = 0; i < cfg->profmonitors_count; i++) {
-        if (strcmp(monitordesc, cfg->profmonitors[i]) == 0)
-            return 1;
-    }
-    return 0;
+/* ---------------- Global Child Process Handling ---------------- */
+volatile pid_t child_pid = -1;
+
+void sigchld_handler(int signum) {
+    (void)signum;
+    child_pid = -1;
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
 }
 
-/* ---------------- Building Child Command Arguments ---------------- */
-/* Build an argv array for execvp() by iterating over the config->args tokens.
-   Replace any token equal to "monitorid" with info->monitorid and any token equal
-   to "assetsdir" with cfg->assets. Then append the chosen wallpaper filename.
-   Returns a NULL-terminated argv array. */
-char **build_child_argv(const monitor_info_t *info, Config *cfg, const char *wallpaper) {
-    char **child_argv = malloc((cfg->args_count + 3) * sizeof(char *));
-    if (!child_argv) { perror("malloc"); exit(EXIT_FAILURE); }
-    child_argv[0] = cfg->exe;
-    child_argv++;
-    for (int i = 0; i < cfg->args_count; i++) {
-        if (strcmp(cfg->args[i], "monitorid") == 0)
-            child_argv[i] = info->monitorid;
-        else if (strcmp(cfg->args[i], "monitorname") == 0)
-            child_argv[i] = info->monitorname;
-        else if (strcmp(cfg->args[i], "monitordesc") == 0)
-            child_argv[i] = info->monitordesc;
-        else if (strcmp(cfg->args[i], "assetsdir") == 0)
-            child_argv[i] = cfg->assets;
-        else
-            child_argv[i] = cfg->args[i];
-    }
-    child_argv[cfg->args_count] = (char *)wallpaper;
-    child_argv[cfg->args_count + 1] = NULL;
-    child_argv--;
-    return child_argv;
-}
-
-/* ---------------- Launch Monitor Process ---------------- */
-/*
-   This function encapsulates the common logic for launching a monitor process.
-   It selects a wallpaper (using the default or profile directory based on the
-   monitor description), forks a child process to execute the external binary,
-   and registers the process in the monitor table.
+/* Build argv for execvp:
+   Start with cfg->exe, then the tokens from cfg->args (with substitution for "assetsdir"),
+   then for every monitor in the array, append:
+     "--screen-root", monitor name, "--bg", chosen wallpaper.
+   Returns a NULL-terminated argv array.
 */
-void launch_monitor_process(const monitor_info_t *info, Config *cfg) {
-    const char *wallpaper_dir = cfg->papers;
-    if (use_profile_wallpapers(info->monitordesc, cfg) && cfg->profpapers)
-        wallpaper_dir = cfg->profpapers;
-    char *wallpaper = choose_random_wallpaper(wallpaper_dir);
-    if (!wallpaper) {
-        fprintf(stderr, "No wallpaper found in directory %s\n", wallpaper_dir);
-        return;
+char **build_child_argv(Config *cfg, MonitorArray *ma) {
+    int total = 2 + cfg->args_count + ma->count * 4;  // exe + base args + extra + NULL
+    if (cfg->assets) total += 2;
+    char **argv = malloc(total * sizeof(char *));
+    if (!argv) { perror("malloc"); exit(EXIT_FAILURE); }
+    int idx = 0;
+    argv[idx++] = cfg->exe;
+    if (cfg->assets) {
+        argv[idx++] = "--assets-dir";
+        argv[idx++] = cfg->assets;
     }
+    for (int i = 0; i < cfg->args_count; i++)
+        argv[idx++] = cfg->args[i];
+    for (int i = 0; i < ma->count; i++) {
+        argv[idx++] = "--screen-root";
+        argv[idx++] = ma->entries[i]->name;
+        argv[idx++] = "--bg";
+        argv[idx++] = ma->entries[i]->wallpaper;
+    }
+    argv[idx] = NULL;
+    return argv;
+}
+
+/* Restart the child process with the current monitor list.
+   If a process is already running, kill it and wait for it to exit.
+*/
+void restart_child_process(Config *cfg, MonitorArray *ma) {
+    if (child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        waitpid(child_pid, NULL, 0);
+    }
+    char **child_argv = build_child_argv(cfg, ma);
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        free(wallpaper);
+        free(child_argv);
         return;
     }
     if (pid == 0) {
@@ -304,35 +343,18 @@ void launch_monitor_process(const monitor_info_t *info, Config *cfg) {
             perror("prctl");
             exit(EXIT_FAILURE);
         }
-        if (getppid() == 1)
-            exit(EXIT_FAILURE);
-        FILE *devnull = fopen("/dev/null", "w");
-        if (devnull) {
-            dup2(fileno(devnull), STDOUT_FILENO);
-            fclose(devnull);
-        }
-        char **child_argv = build_child_argv(info, cfg, wallpaper);
         execvp(child_argv[0], child_argv);
         perror("execvp");
         free(child_argv);
         exit(EXIT_FAILURE);
     }
-    add_monitor_proc_ht(info->monitorname, pid);
-    free(wallpaper);
-}
-
-/* ---------------- Bootstrap Monitor from Positional Argument ---------------- */
-void bootstrap_monitor(const char *monitor_name, Config *cfg) {
-    monitor_info_t info;
-    info.monitorid = (char *)monitor_name;
-    info.monitorname = (char *)monitor_name;
-    info.monitordesc = (char *)monitor_name;
-    launch_monitor_process(&info, cfg);
+    child_pid = pid;
+    free(child_argv);
 }
 
 /* ---------------- Event Handling ---------------- */
 /* Each event is in the format: EVENT>>DATA */
-void handle_line(char *line, Config *cfg) {
+void handle_line(char *line, Config *cfg, MonitorArray *ma) {
     char *delim = strstr(line, ">>");
     if (!delim) return;
     *delim = '\0';
@@ -343,18 +365,19 @@ void handle_line(char *line, Config *cfg) {
             fprintf(stderr, "Invalid monitoraddedv2 data\n");
             return;
         }
-        launch_monitor_process(&info, cfg);
+        add_monitor_entry(ma, info.monitorname, info.monitordesc, cfg);
+        restart_child_process(cfg, ma);
     } else if (strcmp(line, "monitorremoved") == 0) {
-        char *monitorname = data;
-        monitor_entry_t *entry;
-        HASH_FIND_STR(monitor_table, monitorname, entry);
-        if (entry) {
-            if (kill(entry->pid, 0) == 0 && belongs_to_same_group(entry->pid))
-                kill(entry->pid, SIGTERM);
-            remove_monitor_proc_ht(monitorname);
-        }
+        remove_monitor_entry(ma, data);
+        restart_child_process(cfg, ma);
     }
     /* Ignore other events */
+}
+
+/* ---------------- Bootstrap Monitor from Positional Argument ---------------- */
+/* For bootstrapped monitors, we assume the monitor description equals the monitor name */
+void bootstrap_monitor(const char *monitor_name, Config *cfg, MonitorArray *ma) {
+    add_monitor_entry(ma, monitor_name, monitor_name, cfg);
 }
 
 /* ---------------- Main ---------------- */
@@ -365,19 +388,21 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--config") == 0) {
             if (++i < argc)
                 config_file = argv[i];
-            else { fprintf(stderr, "Missing filename for --config\n"); exit(EXIT_FAILURE); }
-        }
-        else break;
+            else {
+                fprintf(stderr, "Missing filename for --config\n");
+                exit(EXIT_FAILURE);
+            }
+        } else break;
         i++;
     }
     Config *cfg = read_config(config_file);
     if (!cfg) { fprintf(stderr, "Failed to read config\n"); exit(EXIT_FAILURE); }
-    if (!cfg->exe || !cfg->args || cfg->args_count == 0 || !cfg->papers || !cfg->assets) {
+    if (!cfg->exe || !cfg->args || cfg->args_count == 0 || !cfg->papers) {
         fprintf(stderr, "Config missing required keys\n");
         free_config(cfg);
         exit(EXIT_FAILURE);
     }
-    /* profpapers is optional */
+    // Change working directory to the directory of the executable
     char *exe_path = strdup(cfg->exe);
     if (!exe_path) {
         perror("strdup");
@@ -390,19 +415,22 @@ int main(int argc, char *argv[]) {
         free(exe_path);
         free_config(cfg);
         exit(EXIT_FAILURE);
-        // Depending on requirements, you might want to exit or continue
     }
     free(exe_path);
-
     srand(time(NULL));
 
-    /* Bootstrap monitors provided as extra positional arguments */
+    // Initialize monitor array and add any monitors provided as extra positional arguments.
+    MonitorArray monitor_array;
+    init_monitor_array(&monitor_array);
     while (i < argc) {
-        bootstrap_monitor(argv[i], cfg);
+        bootstrap_monitor(trim_whitespace(argv[i]), cfg, &monitor_array);
         i++;
-        sleep(3);
     }
+    // If we have any monitors at startup, start the child process.
+    if (monitor_array.count > 0)
+        restart_child_process(cfg, &monitor_array);
 
+    // Set up SIGCHLD handler.
     struct sigaction sa;
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
@@ -413,6 +441,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Set up socket connection.
     char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     char *hypr_signature = getenv("HYPRLAND_INSTANCE_SIGNATURE");
     if (!runtime_dir || !hypr_signature) {
@@ -430,7 +459,6 @@ int main(int argc, char *argv[]) {
         free_config(cfg);
         exit(EXIT_FAILURE);
     }
-
     int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sockfd < 0) { perror("socket"); free_config(cfg); exit(EXIT_FAILURE); }
     if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -439,20 +467,41 @@ int main(int argc, char *argv[]) {
         free_config(cfg);
         exit(EXIT_FAILURE);
     }
-
     FILE *sock_fp = fdopen(sockfd, "r");
     if (!sock_fp) { perror("fdopen"); close(sockfd); free_config(cfg); exit(EXIT_FAILURE); }
 
+    time_t last_update_time = time(NULL);
     char *line = NULL;
     size_t len = 0;
     while (getline(&line, &len, sock_fp) != -1) {
+        // Check if enough time has passed to update wallpapers.
+        time_t current_time = time(NULL);
+        if (cfg->timer > 0 && difftime(current_time, last_update_time) >= cfg->timer * 60) {
+            for (int j = 0; j < monitor_array.count; j++) {
+                MonitorEntry *entry = monitor_array.entries[j];
+                free(entry->wallpaper);
+                const char *wallpaper_dir = cfg->papers;
+                if (use_profile_wallpapers(entry->monitordesc, cfg))
+                    wallpaper_dir = cfg->profpapers;
+                entry->wallpaper = choose_random_wallpaper(wallpaper_dir);
+            }
+            restart_child_process(cfg, &monitor_array);
+            last_update_time = current_time;
+        }
         line[strcspn(line, "\n")] = '\0';
         if (strlen(line) > 0)
-            handle_line(line, cfg);
-        if (child_died_flag) { cleanup_dead_processes(); child_died_flag = 0; }
+            handle_line(line, cfg, &monitor_array);
+        if (child_pid < 0 && monitor_array.count > 0)
+            restart_child_process(cfg, &monitor_array);
     }
     free(line);
     fclose(sock_fp);
+    // Clean up: terminate child process and free resources.
+    if (child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        waitpid(child_pid, NULL, 0);
+    }
+    free_monitor_array(&monitor_array);
     free_config(cfg);
     return 0;
 }
