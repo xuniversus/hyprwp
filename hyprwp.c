@@ -212,9 +212,9 @@ int find_monitor_index(MonitorArray *ma, const char *name) {
 
 /* Adds a monitor entry. If monitordesc is provided, use it to determine the wallpaper directory.
    For bootstrapped monitors, monitordesc can be the same as name. */
-void add_monitor_entry(MonitorArray *ma, const char *name, const char *monitordesc, Config *cfg) {
+inline bool add_monitor_entry(MonitorArray *ma, const char *name, const char *monitordesc, Config *cfg) {
     if (strcmp(name, "FALLBACK") == 0 || find_monitor_index(ma, name) != -1)
-        return; // already present
+        return false; // already present
 
     const char *wallpaper_dir = cfg->papers;
     if (use_profile_wallpapers(monitordesc, cfg))
@@ -223,7 +223,7 @@ void add_monitor_entry(MonitorArray *ma, const char *name, const char *monitorde
     char *wallpaper = choose_random_wallpaper(wallpaper_dir);
     if (!wallpaper) {
         fprintf(stderr, "No wallpaper found in directory %s for monitor %s\n", wallpaper_dir, name);
-        return;
+        return false;
     }
 
     MonitorEntry *entry = malloc(sizeof(MonitorEntry));
@@ -239,12 +239,13 @@ void add_monitor_entry(MonitorArray *ma, const char *name, const char *monitorde
         ma->entries = tmp;
     }
     ma->entries[ma->count++] = entry;
+    return true;
 }
 
-void remove_monitor_entry(MonitorArray *ma, const char *name) {
+inline bool remove_monitor_entry(MonitorArray *ma, const char *name) {
     int idx = find_monitor_index(ma, name);
     if (idx == -1)
-        return;
+        return false;
     free(ma->entries[idx]->name);
     free(ma->entries[idx]->monitordesc);
     free(ma->entries[idx]->wallpaper);
@@ -253,6 +254,7 @@ void remove_monitor_entry(MonitorArray *ma, const char *name) {
         ma->entries[i] = ma->entries[i+1];
     }
     ma->count--;
+    return true;
 }
 
 void free_monitor_array(MonitorArray *ma) {
@@ -368,11 +370,9 @@ bool handle_line(char *line, Config *cfg, MonitorArray *ma) {
             fprintf(stderr, "Invalid monitoraddedv2 data\n");
             return false;
         }
-        add_monitor_entry(ma, info.monitorname, info.monitordesc, cfg);
-        return true;
+        return add_monitor_entry(ma, info.monitorname, info.monitordesc, cfg);
     } else if (strcmp(line, "monitorremoved") == 0) {
-        remove_monitor_entry(ma, data);
-        return true;
+        return remove_monitor_entry(ma, data);
     }
     /* Ignore other events */
     return false;
