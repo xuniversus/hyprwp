@@ -331,25 +331,27 @@ void restart_child_process(Config *cfg, MonitorArray *ma) {
         kill(child_pid, SIGTERM);
         waitpid(child_pid, NULL, 0);
     }
-    char **child_argv = build_child_argv(cfg, ma);
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        free(child_argv);
-        return;
-    }
-    if (pid == 0) {
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) == -1) {
-            perror("prctl");
+    if (ma->count > 0) {
+        char **child_argv = build_child_argv(cfg, ma);
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            free(child_argv);
+            return;
+        }
+        if (pid == 0) {
+            if (prctl(PR_SET_PDEATHSIG, SIGTERM) == -1) {
+                perror("prctl");
+                exit(EXIT_FAILURE);
+            }
+            execvp(child_argv[0], child_argv);
+            perror("execvp");
+            free(child_argv);
             exit(EXIT_FAILURE);
         }
-        execvp(child_argv[0], child_argv);
-        perror("execvp");
+        child_pid = pid;
         free(child_argv);
-        exit(EXIT_FAILURE);
     }
-    child_pid = pid;
-    free(child_argv);
 }
 
 /* ---------------- Event Handling ---------------- */
@@ -427,8 +429,7 @@ int main(int argc, char *argv[]) {
         i++;
     }
     // If we have any monitors at startup, start the child process.
-    if (monitor_array.count > 0)
-        restart_child_process(cfg, &monitor_array);
+    restart_child_process(cfg, &monitor_array);
 
     // Set up SIGCHLD handler.
     struct sigaction sa;
@@ -491,7 +492,7 @@ int main(int argc, char *argv[]) {
         line[strcspn(line, "\n")] = '\0';
         if (strlen(line) > 0)
             handle_line(line, cfg, &monitor_array);
-        if (child_pid < 0 && monitor_array.count > 0)
+        if (child_pid < 0)
             restart_child_process(cfg, &monitor_array);
     }
     free(line);
