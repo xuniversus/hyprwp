@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -170,14 +171,14 @@ char *choose_random_wallpaper(const char *dirpath) {
 
 /* Check if monitordesc matches any string in the profmonitors array.
    Returns 1 if it does (and if a profpapers directory is set), else 0. */
-int use_profile_wallpapers(const char *monitordesc, Config *cfg) {
+bool use_profile_wallpapers(const char *monitordesc, Config *cfg) {
     if (!cfg->profpapers)
-        return 0;
+        return false;
     for (int i = 0; i < cfg->profmonitors_count; i++) {
         if (strcmp(monitordesc, cfg->profmonitors[i]) == 0)
-            return 1;
+            return true;
     }
-    return 0;
+    return false;
 }
 
 /* ---------------- Monitor Data Structures ---------------- */
@@ -271,17 +272,17 @@ typedef struct {
     char *monitordesc;
 } monitor_info_t;
 /* Expected format: MONITORID,MONITORNAME,MONITORDESCRIPTION */
-int parse_monitoradded_data(char *data, monitor_info_t *info) {
+bool parse_monitoradded_data(char *data, monitor_info_t *info) {
     char *token = strsep(&data, ",");
-    if (!token) return -1;
+    if (!token) return false;
     info->monitorid = token;
     token = strsep(&data, ",");
-    if (!token) return -1;
+    if (!token) return false;
     info->monitorname = token;
     token = strsep(&data, ",");
-    if (!token) return -1;
+    if (!token) return false;
     info->monitordesc = token;
-    return 0;
+    return true;
 }
 
 /* ---------------- Global Child Process Handling ---------------- */
@@ -356,29 +357,30 @@ void restart_child_process(Config *cfg, MonitorArray *ma) {
 
 /* ---------------- Event Handling ---------------- */
 /* Each event is in the format: EVENT>>DATA */
-void handle_line(char *line, Config *cfg, MonitorArray *ma) {
+bool handle_line(char *line, Config *cfg, MonitorArray *ma) {
     char *delim = strstr(line, ">>");
-    if (!delim) return;
+    if (!delim) return false;
     *delim = '\0';
     char *data = delim + 2;
     if (strcmp(line, "monitoraddedv2") == 0) {
         monitor_info_t info = {0};
-        if (parse_monitoradded_data(data, &info) != 0) {
+        if (!parse_monitoradded_data(data, &info)) {
             fprintf(stderr, "Invalid monitoraddedv2 data\n");
-            return;
+            return false;
         }
         add_monitor_entry(ma, info.monitorname, info.monitordesc, cfg);
-        restart_child_process(cfg, ma);
+        return true;
     } else if (strcmp(line, "monitorremoved") == 0) {
         remove_monitor_entry(ma, data);
-        restart_child_process(cfg, ma);
+        return true;
     }
     /* Ignore other events */
+    return false;
 }
 
 /* ---------------- Bootstrap Monitor from Positional Argument ---------------- */
 /* For bootstrapped monitors, we assume the monitor description equals the monitor name */
-void bootstrap_monitor(const char *monitor_name, Config *cfg, MonitorArray *ma) {
+inline void bootstrap_monitor(const char *monitor_name, Config *cfg, MonitorArray *ma) {
     add_monitor_entry(ma, monitor_name, monitor_name, cfg);
 }
 
@@ -476,7 +478,11 @@ int main(int argc, char *argv[]) {
     size_t len = 0;
     while (getline(&line, &len, sock_fp) != -1) {
         // Check if enough time has passed to update wallpapers.
+        line[strcspn(line, "\n")] = '\0';
         time_t current_time = time(NULL);
+        bool res = false;
+        if (strlen(line) > 0)
+            res = handle_line(line, cfg, &monitor_array);
         if (cfg->timer > 0 && difftime(current_time, last_update_time) >= cfg->timer * 60) {
             for (int j = 0; j < monitor_array.count; j++) {
                 MonitorEntry *entry = monitor_array.entries[j];
@@ -488,11 +494,7 @@ int main(int argc, char *argv[]) {
             }
             restart_child_process(cfg, &monitor_array);
             last_update_time = current_time;
-        }
-        line[strcspn(line, "\n")] = '\0';
-        if (strlen(line) > 0)
-            handle_line(line, cfg, &monitor_array);
-        if (child_pid < 0)
+        } else if (child_pid < 0 || res)
             restart_child_process(cfg, &monitor_array);
     }
     free(line);
