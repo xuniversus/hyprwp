@@ -213,7 +213,7 @@ int find_monitor_index(MonitorArray *ma, const char *name) {
 /* Adds a monitor entry. If monitordesc is provided, use it to determine the wallpaper directory.
    For bootstrapped monitors, monitordesc can be the same as name. */
 void add_monitor_entry(MonitorArray *ma, const char *name, const char *monitordesc, Config *cfg) {
-    if (find_monitor_index(ma, name) != -1)
+    if (strcmp(name, "FALLBACK") == 0 || find_monitor_index(ma, name) != -1)
         return; // already present
 
     const char *wallpaper_dir = cfg->papers;
