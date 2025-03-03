@@ -62,7 +62,7 @@ char **parse_list(const char *value, int *count) {
                 tokens = tmp;
             }
             tokens[num++] = token;
-        }
+        } else { perror("strndup"); break; }
     }
     *count = num;
     return tokens;
@@ -70,8 +70,10 @@ char **parse_list(const char *value, int *count) {
 
 /* ---------------- Simple Config Parser ---------------- */
 char *trim_whitespace(char *str) {
+    if (!str) return str;
     while (*str && isspace((unsigned char)*str))
         str++;
+    if (*str == '\0') return str;
     char *end = str + strlen(str) - 1;
     while (end > str && isspace((unsigned char)*end))
         *end-- = '\0';
@@ -205,7 +207,7 @@ void init_monitor_array(MonitorArray *ma) {
     ma->count = 0;
     ma->capacity = 4;
     ma->entries = malloc(ma->capacity * sizeof(MonitorEntry *));
-    if (!ma->entries) { perror("malloc"); return; }
+    if (!ma->entries) { perror("malloc"); }
 }
 
 int find_monitor_index(MonitorArray *ma, const char *name) {
@@ -369,6 +371,7 @@ void restart_child_process(Config *cfg, MonitorArray *ma) {
         if (pid == 0) {
             if (prctl(PR_SET_PDEATHSIG, SIGTERM) == -1) {
                 perror("prctl");
+                free(child_argv);
                 exit(EXIT_FAILURE);
             }
             execvp(child_argv[0], child_argv);
@@ -410,45 +413,39 @@ void bootstrap_monitor(const char *monitor_name, Config *cfg, MonitorArray *ma) 
 
 /* ---------------- Main ---------------- */
 int main(int argc, char *argv[]) {
+    int ret = EXIT_FAILURE; // Default to fail if exit
     const char *config_file = "config.txt";
+    Config *cfg = NULL;
+    MonitorArray monitor_array;
+    char *exe_path = NULL;
+    struct sockaddr_un addr;
+    int sockfd = -1;
+    FILE *sock_fp = NULL;
+    char *line = NULL;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0) {
             if (++i < argc)
                 config_file = argv[i];
-            else {
-                fprintf(stderr, "Missing filename for --config\n");
-                exit(EXIT_FAILURE);
-            }
+            else { fprintf(stderr, "Missing filename for --config\n"); goto cleanup; }
         } else break;
     }
-    Config *cfg = read_config(config_file);
-    if (!cfg) { fprintf(stderr, "Failed to read config\n"); exit(EXIT_FAILURE); }
+    cfg = read_config(config_file);
+    if (!cfg) { fprintf(stderr, "Failed to read config\n"); goto cleanup; }
     if (!cfg->exe || !cfg->args || cfg->args_count == 0 || !cfg->papers) {
-        fprintf(stderr, "Config missing required keys\n");
-        free_config(cfg);
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "Config missing required keys\n"); goto cleanup;
     }
     // Change working directory to the directory of the executable
-    char *exe_path = strdup(cfg->exe);
-    if (!exe_path) {
-        perror("strdup");
-        free_config(cfg);
-        exit(EXIT_FAILURE);
-    }
-    char *dir_path = dirname(exe_path);
-    if (chdir(dir_path) != 0) {
-        perror("chdir to exe directory");
-        free(exe_path);
-        free_config(cfg);
-        exit(EXIT_FAILURE);
-    }
+    exe_path = strdup(cfg->exe);
+    if (!exe_path) { perror("strdup"); goto cleanup; }
+    if (chdir(dirname(exe_path)) != 0) { perror("chdir to exe directory"); goto cleanup; }
     free(exe_path);
+    exe_path = NULL;
     srand(time(NULL));
 
     // Initialize monitor array.
-    MonitorArray monitor_array;
     init_monitor_array(&monitor_array);
-    if (!monitor_array.entries) { perror("monitor array uninitialized"); free_config(cfg); exit(EXIT_FAILURE); }
+    if (!monitor_array.entries) { perror("monitor array uninitialized"); goto cleanup; }
 
     char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     char *hypr_signature = getenv("HYPRLAND_INSTANCE_SIGNATURE");
@@ -456,64 +453,48 @@ int main(int argc, char *argv[]) {
     {
         if (!runtime_dir || !hypr_signature) {
             fprintf(stderr, "Missing environment variables for socket connection\n");
-            free_monitor_array(&monitor_array);
-            free_config(cfg);
-            exit(EXIT_FAILURE);
+            goto cleanup;
         }
-        struct sockaddr_un addr2;
-        memset(&addr2, 0, sizeof(addr2));
-        addr2.sun_family = AF_UNIX;
-        if (snprintf(addr2.sun_path, sizeof(addr2.sun_path),
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        if (snprintf(addr.sun_path, sizeof(addr.sun_path),
                      "%s/hypr/%s/.socket.sock", runtime_dir, hypr_signature)
-            >= sizeof(addr2.sun_path)) {
+            >= sizeof(addr.sun_path)) {
             fprintf(stderr, "Socket path too long for monitor query\n");
-            free_monitor_array(&monitor_array);
-            free_config(cfg);
-            exit(EXIT_FAILURE);
+            goto cleanup;
         }
-        int sockfd2 = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sockfd2 < 0) { perror("socket (monitor query)"); free_config(cfg); exit(EXIT_FAILURE); }
-        if (connect(sockfd2, (struct sockaddr *)&addr2, sizeof(addr2)) < 0) {
+        sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sockfd < 0) { perror("socket (monitor query)"); goto cleanup; }
+        if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             perror("connect (monitor query)");
-            close(sockfd2);
-            free_monitor_array(&monitor_array);
-            free_config(cfg);
-            exit(EXIT_FAILURE);
+            goto cleanup;
         }
-        FILE *sock2_fp = fdopen(sockfd2, "r+");
-        if (!sock2_fp) { perror("fdopen (monitor query)"); close(sockfd2); free_config(cfg); exit(EXIT_FAILURE); }
+        sock_fp = fdopen(sockfd, "r+");
+        if (!sock_fp) { perror("fdopen (monitor query)"); goto cleanup; }
 
         // Write command to retrieve monitors.
-        fprintf(sock2_fp, "/monitors\n");
-        fflush(sock2_fp);
+        fprintf(sock_fp, "/monitors\n");
+        fflush(sock_fp);
 
         // Read the entire response into an array of lines.
         char **lines = NULL;
         int lines_count = 0, lines_capacity = 10;
         lines = malloc(lines_capacity * sizeof(char *));
-        if (!lines) {
-            perror("malloc");
-            fclose(sock2_fp);
-            free_monitor_array(&monitor_array);
-            free_config(cfg);
-            exit(EXIT_FAILURE);
-        }
+        if (!lines) { perror("malloc"); goto cleanup; }
         char *mon_line = NULL;
         size_t mon_len = 0;
-        while (getline(&mon_line, &mon_len, sock2_fp) != -1) {
+        while (getline(&mon_line, &mon_len, sock_fp) != -1) {
             mon_line[strcspn(mon_line, "\n")] = '\0';
             char *trim = trim_whitespace(mon_line);
             if (strlen(trim) == 0)
                 continue;
             else if (strncmp(trim, "Monitor", 7) == 0 || strncmp(trim, "description:", 12) == 0) {
-                char *line_copy = strdup(trim);
-                if (!line_copy) {
+                line = strdup(trim);
+                if (!line) {
                     perror("strdup");
                     free(mon_line);
-                    fclose(sock2_fp);
-                    free_monitor_array(&monitor_array);
-                    free_config(cfg);
-                    exit(EXIT_FAILURE);
+                    free_plist(lines, lines_count);
+                    goto cleanup;
                 }
                 if (lines_count >= lines_capacity) {
                     lines_capacity *= 2;
@@ -521,22 +502,21 @@ int main(int argc, char *argv[]) {
                     if (!tmp) {
                         perror("realloc");
                         free(mon_line);
-                        fclose(sock2_fp);
-                        free_monitor_array(&monitor_array);
-                        free_config(cfg);
-                        exit(EXIT_FAILURE);
+                        free_plist(lines, lines_count);
+                        goto cleanup;
                     }
                     lines = tmp;
                 }
-                lines[lines_count++] = line_copy;
+                lines[lines_count++] = line;
             }
         }
         free(mon_line);
-        fclose(sock2_fp);
+        fclose(sock_fp);
+        sock_fp = NULL;
 
         // Parse lines to retrieve monitors.
         for (int idx = 0; idx < lines_count; idx++) {
-            char *line = lines[idx];
+            line = lines[idx];
             if (strncmp(line, "Monitor", 7) == 0) {
                 // Skip the "Monitor" prefix and any leading whitespace.
                 char *p = line + 7;
@@ -550,9 +530,8 @@ int main(int argc, char *argv[]) {
                 char *monitor_name = malloc(name_len + 1);
                 if (!monitor_name) {
                     perror("malloc monitor_name");
-                    free_monitor_array(&monitor_array);
-                    free_config(cfg);
-                    exit(EXIT_FAILURE);
+                    free_plist(lines, lines_count);
+                    goto cleanup;
                 }
                 strncpy(monitor_name, name_start, name_len);
                 monitor_name[name_len] = '\0';
@@ -562,15 +541,12 @@ int main(int argc, char *argv[]) {
                     perror("malloc description");
                     free_plist(lines, lines_count);
                     free(monitor_name);
-                    free(description);
-                    free_monitor_array(&monitor_array);
-                    free_config(cfg);
-                    exit(EXIT_FAILURE);
+                    goto cleanup;
                 }
                 if (idx + 1 < lines_count) {
-                    char *next_line = lines[idx+1];
-                    if (strncmp(next_line, "description:", 12) == 0) {
-                        char *desc = next_line + 12;
+                    line = lines[idx+1];
+                    if (strncmp(line, "description:", 12) == 0) {
+                        char *desc = line + 12;
                         desc = trim_whitespace(desc);
                         free(description);
                         description = strdup(desc);
@@ -578,10 +554,7 @@ int main(int argc, char *argv[]) {
                             perror("malloc description");
                             free_plist(lines, lines_count);
                             free(monitor_name);
-                            free(description);
-                            free_monitor_array(&monitor_array);
-                            free_config(cfg);
-                            exit(EXIT_FAILURE);
+                            goto cleanup;
                         }
                         idx++; // skip the description line
                     }
@@ -605,37 +578,27 @@ int main(int argc, char *argv[]) {
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     if (sigaction(SIGCHLD, &sa, NULL) == -1) {
         perror("sigaction");
-        free_monitor_array(&monitor_array);
-        free_config(cfg);
-        exit(EXIT_FAILURE);
+        goto cleanup;
     }
 
     // Set up socket connection for events using .socket2.sock.
-    struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     if (snprintf(addr.sun_path, sizeof(addr.sun_path),
                  "%s/hypr/%s/.socket2.sock", runtime_dir, hypr_signature)
         >= sizeof(addr.sun_path)) {
         fprintf(stderr, "Socket path is too long\n");
-        free_monitor_array(&monitor_array);
-        free_config(cfg);
-        exit(EXIT_FAILURE);
+        goto cleanup;
     }
-    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd < 0) { perror("socket"); free_config(cfg); exit(EXIT_FAILURE); }
+    sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sockfd < 0) { perror("socket"); goto cleanup; }
     if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        close(sockfd);
-        free_monitor_array(&monitor_array);
-        free_config(cfg);
-        exit(EXIT_FAILURE);
+        perror("connect"); goto cleanup;
     }
-    FILE *sock_fp = fdopen(sockfd, "r");
-    if (!sock_fp) { perror("fdopen"); close(sockfd); free_config(cfg); exit(EXIT_FAILURE); }
+    sock_fp = fdopen(sockfd, "r");
+    if (!sock_fp) { perror("fdopen"); goto cleanup; }
 
     time_t last_update_time = time(NULL);
-    char *line = NULL;
     size_t len = 0;
     while (getline(&line, &len, sock_fp) != -1) {
         // Check if enough time has passed to update wallpapers.
@@ -647,19 +610,31 @@ int main(int argc, char *argv[]) {
         if (cfg->timer > 0 && difftime(current_time, last_update_time) >= cfg->timer * 60) {
             for (int j = 0; j < monitor_array.count; j++) {
                 MonitorEntry *entry = monitor_array.entries[j];
-                free(entry->wallpaper);
                 const char *wallpaper_dir = cfg->papers;
                 if (use_profile_wallpapers(entry->monitordesc, cfg))
                     wallpaper_dir = cfg->profpapers;
-                entry->wallpaper = choose_random_wallpaper(wallpaper_dir);
+                char *tmp = choose_random_wallpaper(wallpaper_dir);
+                if (!tmp) {
+                    fprintf(stderr, "No wallpaper found in directory %s for monitor %s\n", wallpaper_dir, entry->name);
+                    break;
+                }
+                free(entry->wallpaper);
+                entry->wallpaper = tmp;
             }
             restart_child_process(cfg, &monitor_array);
             last_update_time = current_time;
         } else if (child_pid < 0 || res)
             restart_child_process(cfg, &monitor_array);
     }
+    ret = EXIT_SUCCESS; // if reached end, success
+
+cleanup:
     free(line);
-    fclose(sock_fp);
+    free(exe_path);
+    if (sock_fp)
+        fclose(sock_fp);
+    else if (sockfd != -1)
+        close(sockfd);
     // Clean up: terminate child process and free resources.
     if (child_pid > 0) {
         kill(child_pid, SIGTERM);
@@ -667,5 +642,5 @@ int main(int argc, char *argv[]) {
     }
     free_monitor_array(&monitor_array);
     free_config(cfg);
-    return 0;
+    return ret;
 }
