@@ -9,3 +9,5 @@ papers = LANDSCAPE_WALLPAPERS
 profpapers = PROFIL_WALLPAPERS
 
 profmonitors = HYPRLAND_MONITOR_DESCRIPTORS_PROF
+
+timer = 30
